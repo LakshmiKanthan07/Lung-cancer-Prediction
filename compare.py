@@ -8,9 +8,6 @@ from sklearn.metrics import accuracy_score
 import warnings
 warnings.filterwarnings('ignore')
 
-# ==========================================
-# PHASE 1: DATA INGESTION & HARMONIZATION
-# ==========================================
 def load_and_harmonize():
     print("🔄 [1/4] Loading Raw Data Sources...")
     try:
