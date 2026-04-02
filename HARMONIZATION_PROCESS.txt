@@ -1,0 +1,114 @@
+================================================================================
+DATA HARMONIZATION AND TEMPORAL FEATURE ENGINEERING FOR LUNG CANCER PREDICTION
+================================================================================
+
+This document describes how three discordant datasets were harmonized into a unified
+format and how temporal features (Pack-Year Proxy and Toxic Accumulation) were engineered.
+
+--------------------------------------------------------------------------------
+1. RAW DATA SOURCES (Simulated Real-World Heterogeneity)
+--------------------------------------------------------------------------------
+- Cleveland Clinic data: Structured clinical codes (e.g., Patient_Age, Sex_Code, Family_Hx)
+- NLST study data: Medical shorthand (e.g., yrs, gen, smoke_stat)
+- Public Health survey data: Unstructured text (e.g., Age_Years, Smoker_Score, Pollution_Level)
+
+All three datasets represent the same underlying patient cohort but use different column names,
+formats, and categorical encodings.
+
+--------------------------------------------------------------------------------
+2. SCHEMA MAPPING AND UNIFICATION
+--------------------------------------------------------------------------------
+Each raw record is transformed by mapping disparate column names to a common ontology:
+
+| Raw Source          | Raw Field       | Unified Field     | Transformation                     |
+|---------------------|----------------|-------------------|------------------------------------|
+| Cleveland Clinic    | Patient_Age     | Age               | direct copy                        |
+| NLST                | yrs             | Age               | direct copy                        |
+| Public Health       | Age_Years       | Age               | direct copy                        |
+|---------------------|----------------|-------------------|------------------------------------|
+| Cleveland Clinic    | Sex_Code (1=M,2=F)| Gender          | 1→0 (Male), 2→1 (Female)          |
+| NLST                | gen (M/F)       | Gender            | M→0, F→1                           |
+|---------------------|----------------|-------------------|------------------------------------|
+| Cleveland Clinic    | Family_Hx (Yes/No)| Family_History  | Yes→1, No→0                       |
+| NLST / Public Health| (missing)       | Family_History    | default 0                          |
+
+After mapping, all records share the same column structure.
+
+--------------------------------------------------------------------------------
+3. CATEGORICAL-TO-CONTINUOUS TRANSLATION
+--------------------------------------------------------------------------------
+Machine learning models require numeric inputs. Categorical risk factors are converted
+to continuous probability indices in [0,1] with small random jitter to avoid identical values.
+
+Smoking_Index:
+  - "Non-Smoker"  → uniform(0.0, 0.15)
+  - "Former Smoker" → uniform(0.3, 0.6)
+  - "Smoker"      → uniform(0.7, 0.95)
+
+Pollution_Index:
+  - "Low"    → uniform(0.1, 0.3)
+  - "Medium" → uniform(0.4, 0.6)
+  - "High"   → uniform(0.7, 0.99)
+
+--------------------------------------------------------------------------------
+4. TEMPORAL FEATURE ENGINEERING (Cumulative Damage Proxies)
+--------------------------------------------------------------------------------
+Two novel features capture age-weighted lifetime exposure:
+
+   PackYearProxy = Smoking_Index × (Age / 100)
+   ToxicAccumulation = Pollution_Index × (Age / 100)
+
+Rationale: Older individuals with the same current smoking/pollution level have
+accumulated greater tissue damage, hence higher risk.
+
+These engineered features replace static binary indicators (e.g., "Smoker? Yes/No")
+and provide a continuous, biologically meaningful risk gradient.
+
+--------------------------------------------------------------------------------
+5. ADDITIONAL CONTROLS (Noise Injection for Robustness Testing)
+--------------------------------------------------------------------------------
+Two columns of pure random noise (Uniform[0,1]) are added:
+   - Random_Noise_A
+   - Random_Noise_B
+
+These are used during model training to verify that the XGBoost model correctly
+ignores irrelevant features (importance scores near zero).
+
+--------------------------------------------------------------------------------
+6. TARGET VARIABLE GENERATION (Epistatic Risk Simulation)
+--------------------------------------------------------------------------------
+The binary outcome Target_Risk (0 = healthy, 1 = at risk) is generated using a
+non-linear weighted function that emphasizes engineered features and family history:
+
+   Score = 3×PackYearProxy + 2×ToxicAccumulation + 1.5×Family_History + ε
+   where ε ~ N(0, 0.05)
+
+The Score is normalized to [0,1] across the dataset, and a threshold of 0.5 is applied:
+   Normalized Score > 0.5 → Target_Risk = 1 (high risk)
+   otherwise → 0
+
+This synthetic ground truth models the multiplicative (epistatic) nature of
+gene-environment interactions observed in real carcinogenesis.
+
+--------------------------------------------------------------------------------
+7. FINAL HARMONIZED DATASET
+--------------------------------------------------------------------------------
+The harmonized dataset contains the following 10 columns (9 features + target):
+
+   - Age
+   - Gender
+   - Family_History
+   - Smoking_Index
+   - Pollution_Index
+   - PackYearProxy
+   - ToxicAccumulation
+   - Random_Noise_A
+   - Random_Noise_B
+   - Target_Risk
+
+This unified dataset is saved as "final_harmonized_data.csv" and used for all
+subsequent model training and evaluation.
+
+================================================================================
+For implementation details, see the accompanying Python scripts.
+================================================================================
