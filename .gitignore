@@ -20,6 +20,11 @@ venv.bak/
 # Exception for the necessary harmonized dataset (it's ~46MB, fits in GitHub limits, but raw ones are ignored)
 !final_harmonized_data.csv
 
+# Model cache (generated at runtime)
+model_cache.joblib
+model_cache.hash
+model_cache.hmac
+
 # OS generated files
 .DS_Store
 .DS_Store?

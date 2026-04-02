@@ -1,10 +1,19 @@
+import os
+import html
+import hmac
+import hashlib
+import logging
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import xgboost as xgb
-import time
+import joblib
 from sklearn.model_selection import train_test_split
 import plotly.express as px
+
+logging.basicConfig(level=logging.ERROR)
+logger = logging.getLogger(__name__)
 
 # =========================================================
 # 1. CONFIGURATION
@@ -15,6 +24,15 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+MODEL_CACHE_PATH = "model_cache.joblib"
+MODEL_HASH_PATH = "model_cache.hash"
+MODEL_HMAC_PATH = "model_cache.hmac"
+DATA_PATH = "final_harmonized_data.csv"
+
+RISK_THRESHOLD = 0.40
+CRITICAL_THRESHOLD = 0.65
+MAX_SYMPTOM_BOOST = 0.25
 
 # =========================================================
 # 2. THEME
@@ -40,83 +58,34 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
+
 # =========================================================
-# 3. BACKEND — CALIBRATED LABEL ENGINEERING
-#
-# REALISTIC BASELINE PROBABILITIES (from epidemiology):
-#   - Healthy 25-yr-old non-smoker, clean air  → ~3–5%
-#   - 45-yr-old moderate smoker, suburban      → ~12–18%
-#   - 60-yr-old heavy smoker, family history   → ~35–50%
-#   - 70-yr-old, 30+ pack-years, industrial    → ~55–70%
-#
-# ROOT CAUSE OF 99% BUG:
-#   path weights (0.70 + 0.60 + 0.20 + 0.25 + age_hazard 0.50) summed to >2.0
-#   → almost every patient got total_prob clipped to 1.0
-#   → model learned "always predict high risk"
-#
-# FIX: All path weights are now additive fractions of a 0–1 budget.
-#   base             = 0.03   (population baseline ~3%)
-#   age_hazard       = max 0.15  (continuous, ages 18–90)
-#   pack_year_risk   = max 0.25  (only for real smoking history)
-#   family_risk      = max 0.10  (independent family history)
-#   epistasis_risk   = max 0.15  (family + smoking interaction)
-#   pollution_risk   = max 0.10  (environment)
-#   TOTAL MAX        = 0.03+0.15+0.25+0.10+0.15+0.10 = 0.78
-#   → even worst-case patient stays below 0.80 before clipping
-#   → healthy 25-yr-old non-smoker gets ~0.03 + small age = ~5–7%  ✓
+# 3. BACKEND — MODEL PERSISTENCE & TRAINING
 # =========================================================
-@st.cache_resource
-def load_inference_engine():
-    try:
-        df = pd.read_csv('final_harmonized_data.csv')
-    except FileNotFoundError:
-        return None, "CSV file 'final_harmonized_data.csv' not found in the working directory."
-    except Exception as e:
-        return None, f"Failed to load CSV: {e}"
+def _compute_data_hash(path: str) -> str:
+    """Compute SHA-256 hash of the CSV to detect data changes."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-    required_cols = {'Age', 'Pack_Year_Proxy', 'Family_History',
-                     'Toxic_Accumulation', 'Pollution_Index'}
-    missing = required_cols - set(df.columns)
-    if missing:
-        return None, f"CSV is missing required columns: {missing}"
 
-    # ── BASE ──────────────────────────────────────────────
-    base = 0.03
+def _compute_model_hmac(model_path: str, key: str) -> str:
+    """Compute HMAC-SHA256 of the model file using data hash as key."""
+    mac = hmac.new(key.encode("utf-8"), digestmod=hashlib.sha256)
+    with open(model_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            mac.update(chunk)
+    return mac.hexdigest()
 
-    # ── AGE HAZARD (continuous, max contribution = 0.15) ──
-    # Maps age 18→0.03,  age 55→0.09,  age 90→0.15
-    age_hazard = ((df['Age'] - 18) / (90 - 18)) * 0.15
 
-    # ── SMOKING / PACK-YEAR RISK (max 0.25) ──────────────
-    # Smooth curve: no smoking → 0, 30 pack-years → 0.25
-    pack_year_risk = df['Pack_Year_Proxy'].clip(0, 1) * 0.25
-
-    # ── FAMILY HISTORY (independent, max 0.10) ────────────
-    family_risk = (df['Family_History'] == 1).astype(float) * 0.10
-
-    # ── EPISTASIS: family × smoking interaction (max 0.15) ─
-    # Only fires meaningfully when BOTH are present
-    epistasis_risk = (df['Family_History'] == 1).astype(float) * \
-                     df['Pack_Year_Proxy'].clip(0, 1) * 0.15
-
-    # ── POLLUTION / ENVIRONMENT (max 0.10) ────────────────
-    pollution_risk = df['Pollution_Index'].clip(0, 1) * 0.10
-
-    # ── TOTAL (hard-clipped to 0.85 so even worst case ≠ 1.0) ─
-    total_prob = (base + age_hazard + pack_year_risk +
-                  family_risk + epistasis_risk + pollution_risk).clip(0, 0.85)
-
-    np.random.seed(42)
-    df['Target_Risk'] = np.random.binomial(1, total_prob)
-
+def _train_model(df: pd.DataFrame):
+    """Train XGBoost on the harmonized dataset and return the model."""
     features = [
         'Age', 'Gender', 'Smoking_Index', 'Pollution_Index', 'Family_History',
         'Pack_Year_Proxy', 'Toxic_Accumulation', 'Random_Noise_A', 'Random_Noise_B'
     ]
-    missing_feat = set(features) - set(df.columns)
-    if missing_feat:
-        return None, f"CSV is missing feature columns: {missing_feat}"
-
     X = df[features]
     y = df['Target_Risk']
 
@@ -124,7 +93,6 @@ def load_inference_engine():
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    # scale_pos_weight corrects class imbalance without inflating all predictions
     neg_count = (y_train == 0).sum()
     pos_count = (y_train == 1).sum()
     spw = neg_count / pos_count if pos_count > 0 else 1.0
@@ -140,23 +108,121 @@ def load_inference_engine():
         random_state=42
     )
     model.fit(X_train, y_train)
-    return model, None
+    return model
+
+
+@st.cache_resource
+def load_inference_engine():
+    """Load model from cache if data is unchanged, otherwise retrain."""
+    required_cols = {
+        'Age', 'Pack_Year_Proxy', 'Family_History',
+        'Toxic_Accumulation', 'Pollution_Index',
+        'Gender', 'Smoking_Index', 'Random_Noise_A', 'Random_Noise_B',
+        'Target_Risk'
+    }
+
+    try:
+        df = pd.read_csv(DATA_PATH)
+    except FileNotFoundError:
+        return None, "Required data file not found. Please contact the administrator."
+    except Exception:
+        return None, "Failed to load data. Please contact the administrator."
+
+    missing = required_cols - set(df.columns)
+    if missing:
+        return None, "Data file format is invalid. Please contact the administrator."
+
+    current_hash = _compute_data_hash(DATA_PATH)
+
+    # Try loading cached model if data hasn't changed
+    if (os.path.exists(MODEL_CACHE_PATH)
+            and os.path.exists(MODEL_HASH_PATH)
+            and os.path.exists(MODEL_HMAC_PATH)):
+        try:
+            with open(MODEL_HASH_PATH, "r") as f:
+                cached_hash = f.read().strip()
+            with open(MODEL_HMAC_PATH, "r") as f:
+                expected_hmac = f.read().strip()
+            if cached_hash == current_hash:
+                # Verify model file integrity before deserialization
+                actual_hmac = _compute_model_hmac(MODEL_CACHE_PATH, current_hash)
+                if hmac.compare_digest(actual_hmac, expected_hmac):
+                    model = joblib.load(MODEL_CACHE_PATH)
+                    return model, None
+                else:
+                    logger.error("Model file HMAC mismatch — possible tampering detected.")
+        except Exception:
+            pass  # Cache corrupted, retrain below
+
+    # Retrain and cache with integrity seal
+    try:
+        model = _train_model(df)
+        joblib.dump(model, MODEL_CACHE_PATH)
+        new_hmac = _compute_model_hmac(MODEL_CACHE_PATH, current_hash)
+        with open(MODEL_HASH_PATH, "w") as f:
+            f.write(current_hash)
+        with open(MODEL_HMAC_PATH, "w") as f:
+            f.write(new_hmac)
+        return model, None
+    except Exception as e:
+        logger.error(f"Model training failed: {e}")
+        return None, "Model initialization failed. Please contact the administrator."
 
 
 model, model_error = load_inference_engine()
 
-# Decision threshold: 0.40 — slightly below 0.50 to lean toward caution
-# but NOT so low (e.g. 0.35) that it triggers false alarms for everyone
-RISK_THRESHOLD   = 0.40   # Elevated risk
-CRITICAL_THRESHOLD = 0.65  # Critical risk
 
 # =========================================================
-# 4. SIDEBAR
+# 4. SESSION STATE INITIALIZATION
+# =========================================================
+def _init_session_state():
+    defaults = {
+        "age": 40,
+        "gender": "Male",
+        "smoke_status": "Never Smoked",
+        "years_smoked": 10,
+        "cigs_per_day": 10,
+        "secondhand": "None",
+        "residence": "Rural (Clean Air)",
+        "radon": False,
+        "occupation_hazard": False,
+        "fam_hist": "No",
+        "pulmonary_hx": False,
+        "radiation_hx": False,
+        "sym_cough": False,
+        "sym_weight": False,
+        "sym_breath": False,
+        "sym_blood": False,
+        "sym_pain": False,
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+
+_init_session_state()
+
+
+# =========================================================
+# 5. INPUT SANITIZATION HELPERS
+# =========================================================
+def _esc(text) -> str:
+    """HTML-escape any user-derived or computed string before rendering."""
+    return html.escape(str(text))
+
+
+def _safe_float(value, lo=0.0, hi=1.0) -> float:
+    """Clamp a numeric value to [lo, hi]."""
+    return max(lo, min(hi, float(value)))
+
+
+# =========================================================
+# 6. SIDEBAR
 # =========================================================
 st.sidebar.title("🧬 TeleMedLink")
 st.sidebar.caption("AI-Powered Oncology Screening")
 if model_error:
-    st.sidebar.error(f"⚠️ Model Offline: {model_error}")
+    st.sidebar.error("Model Offline")
 st.sidebar.markdown("---")
 nav = st.sidebar.radio("Module Selection:", [
     "Patient Intake Form",
@@ -183,10 +249,10 @@ if nav == "System Overview":
 
     c1, c2, c3, c4, c5 = st.columns([1, 0.2, 1, 0.2, 1])
     with c1: st.info("**Raw Sources**\n\n📄 Cleveland Clinic\n\n📄 CDC Survey\n\n📄 NLST Study")
-    with c2: st.markdown("<h1 style='text-align:center;margin-top:50px'>➡</h1>", unsafe_allow_html=True)
+    with c2: st.markdown("<h1 style='text-align:center;margin-top:50px'>&#x27A1;</h1>", unsafe_allow_html=True)
     with c3: st.warning("**Harmonization Layer**\n\n⚙️ Schema Mapping\n\n🧹 Data Cleaning\n\n⚗️ Feature Engineering")
-    with c4: st.markdown("<h1 style='text-align:center;margin-top:50px'>➡</h1>", unsafe_allow_html=True)
-    with c5: st.success("**AI Inference**\n\n🧠 XGBoost Classifier\n\n📈 88.64% Accuracy\n\n🛡️ Robust to Noise")
+    with c4: st.markdown("<h1 style='text-align:center;margin-top:50px'>&#x27A1;</h1>", unsafe_allow_html=True)
+    with c5: st.success("**AI Inference**\n\n🧠 XGBoost Classifier\n\n📈 Calibrated Output\n\n🛡️ Robust to Noise")
 
     st.markdown("---")
     st.markdown("#### 2. Technical Novelties")
@@ -194,14 +260,14 @@ if nav == "System Overview":
     with col1:
         st.markdown("""
         <div class="novelty-box">
-        <b>✨ Novelty A: Pack-Year Harmonization</b><br>
+        <b>Novelty A: Pack-Year Harmonization</b><br>
         Instead of binary (Yes/No), we engineered a <b>Pack-Year Proxy</b>:
-        <i>(cigarettes/day ÷ 20) × years smoked</i>, capturing cumulative lung damage over time.
+        <i>(cigarettes/day / 20) x years smoked</i>, capturing cumulative lung damage over time.
         </div>""", unsafe_allow_html=True)
     with col2:
         st.markdown("""
         <div class="novelty-box">
-        <b>🧬 Novelty B: Biological Epistasis</b><br>
+        <b>Novelty B: Biological Epistasis</b><br>
         We model <b>Gene-Environment Interactions</b>. Smoking is exponentially more dangerous
         with family history — a non-linear risk profile simple models miss.
         </div>""", unsafe_allow_html=True)
@@ -210,21 +276,21 @@ if nav == "System Overview":
     with col3:
         st.markdown("""
         <div class="info-box">
-        <b>🧮 Novelty C: Feature Absorption</b><br>
+        <b>Novelty C: Feature Absorption</b><br>
         Secondary risks (Radon, Passive Smoke) scale core indexes before inference —
         capturing complex histories without expanding model dimensionality.
         </div>""", unsafe_allow_html=True)
     with col4:
         st.markdown("""
         <div class="info-box">
-        <b>🌐 Novelty D: Schema Harmonization</b><br>
+        <b>Novelty D: Schema Harmonization</b><br>
         Ingests discordant datasets (clinical codes, survey text, abbreviations) and maps them
         to a <b>Unified Clinical Ontology</b> for cross-hospital deployment.
         </div>""", unsafe_allow_html=True)
     with col5:
         st.markdown("""
         <div class="info-box">
-        <b>🛡️ Novelty E: Noise Resilience</b><br>
+        <b>Novelty E: Noise Resilience</b><br>
         Random meaningless columns were deliberately injected during training.
         XGBoost ignores them entirely, proving it isolates true biological signals only.
         </div>""", unsafe_allow_html=True)
@@ -244,7 +310,7 @@ elif nav == "Harmonization Logic":
     ])
     c1, c2, c3 = st.columns([1, 0.2, 1])
     with c1:
-        st.markdown("**❌ Raw Input (Before)**")
+        st.markdown("**Raw Input (Before)**")
         if source == "Cleveland Clinic (Clinical Codes)":
             st.code('{\n  "Sex_Code": 1,\n  "Family_Hx": "Yes",\n  "Dx_Label": "POS"\n}', language="json")
             st.caption("Issues: Numeric codes, ambiguous headers.")
@@ -255,9 +321,9 @@ elif nav == "Harmonization Logic":
             st.code('{\n  "gen": "M",\n  "smoke_stat": 4,\n  "yrs": 65\n}', language="json")
             st.caption("Issues: Non-standard abbreviations.")
     with c2:
-        st.markdown("<br><br><h1>➡</h1>", unsafe_allow_html=True)
+        st.markdown("<br><br><h1>&#x27A1;</h1>", unsafe_allow_html=True)
     with c3:
-        st.markdown("**✅ Harmonized Output (After)**")
+        st.markdown("**Harmonized Output (After)**")
         if source == "Cleveland Clinic (Clinical Codes)":
             st.code('{\n  "Gender": 1,\n  "Family_History": 1,\n  "Target_Risk": 1\n}', language="json")
         elif source == "CDC Survey (Descriptive Text)":
@@ -287,7 +353,7 @@ elif nav == "Ablation Study (Validation)":
     st.markdown("---")
     st.markdown(
         f"<h3 style='text-align:center;color:#2980b9;'>"
-        f"💡 Harmonization Layer improved XGBoost to {xgb_enh:.2f}% accuracy</h3>",
+        f"Harmonization Layer improved XGBoost to {xgb_enh:.2f}% accuracy</h3>",
         unsafe_allow_html=True
     )
     st.markdown("---")
@@ -304,12 +370,16 @@ elif nav == "Ablation Study (Validation)":
     img_col1, img_col2 = st.columns(2)
     with img_col1:
         st.markdown("**ROC Curve Comparison**")
-        try: st.image('roc_curve_comparison.png', use_container_width=True)
-        except FileNotFoundError: st.error("⚠️ 'roc_curve_comparison.png' not found.")
+        if os.path.exists('roc_curve_comparison.png'):
+            st.image('roc_curve_comparison.png', use_container_width=True)
+        else:
+            st.warning("ROC curve image not available.")
     with img_col2:
         st.markdown("**Champion Model Confusion Matrix**")
-        try: st.image('confusion_matrix.png', use_container_width=True)
-        except FileNotFoundError: st.error("⚠️ 'confusion_matrix.png' not found.")
+        if os.path.exists('confusion_matrix.png'):
+            st.image('confusion_matrix.png', use_container_width=True)
+        else:
+            st.warning("Confusion matrix image not available.")
 
     st.markdown("---")
     col_text, col_chart = st.columns([1, 1.5])
@@ -317,8 +387,10 @@ elif nav == "Ablation Study (Validation)":
         st.write("Engineered features like **Pack-Year Proxy** dominate the decision-making process.")
         st.info("The model correctly ignores 'Random Noise', proving it has not overfit to irrelevant data.")
     with col_chart:
-        try: st.image('feature_importance.png', use_container_width=True)
-        except FileNotFoundError: st.error("⚠️ 'feature_importance.png' not found.")
+        if os.path.exists('feature_importance.png'):
+            st.image('feature_importance.png', use_container_width=True)
+        else:
+            st.warning("Feature importance image not available.")
 
 # =========================================================
 # PAGE: PATIENT INTAKE
@@ -328,48 +400,100 @@ elif nav == "Patient Intake Form":
     st.markdown("Run live predictions using the **Champion Model** (XGBoost Calibrated).")
 
     if model is None:
-        st.error(f"⚠️ System Offline. {model_error}")
+        st.error("System Offline. Model could not be loaded.")
         st.stop()
 
     # SECTION 1 — DEMOGRAPHICS
     st.subheader("1. Patient Profile")
     c1, c2 = st.columns(2)
-    with c1: age    = st.number_input("Age (Years)", min_value=18, max_value=90, value=40)
-    with c2: gender = st.selectbox("Biological Sex", ["Male", "Female"])
+    with c1:
+        age = st.number_input(
+            "Age (Years)", min_value=18, max_value=90,
+            value=st.session_state["age"], key="age_input"
+        )
+        st.session_state["age"] = age
+    with c2:
+        gender = st.selectbox(
+            "Biological Sex", ["Male", "Female"],
+            index=["Male", "Female"].index(st.session_state["gender"]),
+            key="gender_input"
+        )
+        st.session_state["gender"] = gender
 
     st.markdown("---")
 
     # SECTION 2 — SMOKING
     st.subheader("2. Smoking & Lifestyle History")
-    smoke_status = st.radio("Primary Smoking Status",
-                            ["Never Smoked", "Former Smoker", "Current Smoker"], horizontal=True)
+    smoke_status = st.radio(
+        "Primary Smoking Status",
+        ["Never Smoked", "Former Smoker", "Current Smoker"],
+        horizontal=True,
+        index=["Never Smoked", "Former Smoker", "Current Smoker"].index(st.session_state["smoke_status"]),
+        key="smoke_status_input"
+    )
+    st.session_state["smoke_status"] = smoke_status
 
+    is_smoker = smoke_status != "Never Smoked"
     years_smoked, cigs_per_day = 0, 0
-    if smoke_status != "Never Smoked":
+
+    if is_smoker:
         col_a, col_b = st.columns(2)
         with col_a:
             max_years = max(1, int(age) - 10)
-            years_smoked = st.slider("Total Years Smoked", 1, max_years, min(10, max_years))
+            years_smoked = st.slider(
+                "Total Years Smoked", 1, max_years,
+                min(st.session_state["years_smoked"], max_years),
+                key="years_smoked_input"
+            )
+            st.session_state["years_smoked"] = years_smoked
         with col_b:
-            cigs_per_day = st.slider("Average Cigarettes per Day", 1, 60, 10)
+            cigs_per_day = st.slider(
+                "Average Cigarettes per Day", 1, 60,
+                st.session_state["cigs_per_day"],
+                key="cigs_per_day_input"
+            )
+            st.session_state["cigs_per_day"] = cigs_per_day
             st.caption(f"Equivalent to {cigs_per_day / 20:.1f} packs/day")
 
-    secondhand = st.selectbox("Secondhand Smoke Exposure",
-                              ["None", "Occasional (Social)", "Daily (Home/Work)"])
+    secondhand_options = ["None", "Occasional (Social)", "Daily (Home/Work)"]
+    secondhand = st.selectbox(
+        "Secondhand Smoke Exposure",
+        secondhand_options,
+        index=secondhand_options.index(st.session_state["secondhand"]),
+        key="secondhand_input",
+        disabled=not is_smoker
+    )
+    st.session_state["secondhand"] = secondhand
 
     st.markdown("---")
 
     # SECTION 3 — ENVIRONMENT
     st.subheader("3. Environmental Factors")
+    residence_options = [
+        "Rural (Clean Air)", "Suburban (Moderate)",
+        "Urban City Center (Poor)", "Industrial Zone (Hazardous)"
+    ]
     col_x, col_y = st.columns(2)
     with col_x:
-        residence = st.selectbox("Primary Residence Type", [
-            "Rural (Clean Air)", "Suburban (Moderate)",
-            "Urban City Center (Poor)", "Industrial Zone (Hazardous)"
-        ])
-        radon = st.checkbox("High Radon area / untested basement (>5 yrs)?")
+        residence = st.selectbox(
+            "Primary Residence Type", residence_options,
+            index=residence_options.index(st.session_state["residence"]),
+            key="residence_input"
+        )
+        st.session_state["residence"] = residence
+        radon = st.checkbox(
+            "High Radon area / untested basement (>5 yrs)?",
+            value=st.session_state["radon"],
+            key="radon_input"
+        )
+        st.session_state["radon"] = radon
     with col_y:
-        occupation_hazard = st.checkbox("Occupational Exposure? (Asbestos, Silica, Mining)")
+        occupation_hazard = st.checkbox(
+            "Occupational Exposure? (Asbestos, Silica, Mining)",
+            value=st.session_state["occupation_hazard"],
+            key="occupation_input"
+        )
+        st.session_state["occupation_hazard"] = occupation_hazard
 
     st.markdown("---")
 
@@ -377,21 +501,62 @@ elif nav == "Patient Intake Form":
     st.subheader("4. Clinical History")
     col_m, col_n = st.columns(2)
     with col_m:
-        fam_hist     = st.radio("Immediate Family History of Lung Cancer?", ["No", "Yes"], horizontal=True)
-        pulmonary_hx = st.checkbox("History of COPD, Emphysema, or Tuberculosis?")
-        radiation_hx = st.checkbox("Previous Chest Radiation Therapy?")
+        fam_hist = st.radio(
+            "Immediate Family History of Lung Cancer?", ["No", "Yes"],
+            horizontal=True,
+            index=["No", "Yes"].index(st.session_state["fam_hist"]),
+            key="fam_hist_input"
+        )
+        st.session_state["fam_hist"] = fam_hist
+        pulmonary_hx = st.checkbox(
+            "History of COPD, Emphysema, or Tuberculosis?",
+            value=st.session_state["pulmonary_hx"],
+            key="pulmonary_input"
+        )
+        st.session_state["pulmonary_hx"] = pulmonary_hx
+        radiation_hx = st.checkbox(
+            "Previous Chest Radiation Therapy?",
+            value=st.session_state["radiation_hx"],
+            key="radiation_input"
+        )
+        st.session_state["radiation_hx"] = radiation_hx
     with col_n:
         st.markdown("**Current Symptoms**")
-        sym_cough  = st.checkbox("Persistent Cough (> 3 weeks)")
-        sym_weight = st.checkbox("Unexplained Weight Loss")
-        sym_breath = st.checkbox("Shortness of Breath")
-        sym_blood  = st.checkbox("Coughing Blood / Haemoptysis 🚨")
-        sym_pain   = st.checkbox("Chest Pain or Bone Pain 🚨")
+        sym_cough = st.checkbox(
+            "Persistent Cough (> 3 weeks)",
+            value=st.session_state["sym_cough"],
+            key="cough_input"
+        )
+        st.session_state["sym_cough"] = sym_cough
+        sym_weight = st.checkbox(
+            "Unexplained Weight Loss",
+            value=st.session_state["sym_weight"],
+            key="weight_input"
+        )
+        st.session_state["sym_weight"] = sym_weight
+        sym_breath = st.checkbox(
+            "Shortness of Breath",
+            value=st.session_state["sym_breath"],
+            key="breath_input"
+        )
+        st.session_state["sym_breath"] = sym_breath
+        sym_blood = st.checkbox(
+            "Coughing Blood / Haemoptysis",
+            value=st.session_state["sym_blood"],
+            key="blood_input"
+        )
+        st.session_state["sym_blood"] = sym_blood
+        sym_pain = st.checkbox(
+            "Chest Pain or Bone Pain",
+            value=st.session_state["sym_pain"],
+            key="pain_input"
+        )
+        st.session_state["sym_pain"] = sym_pain
 
     st.markdown("---")
     st.markdown("""
     <div class="warning-box">
-    ⚠️ <b>Clinical Disclaimer:</b> This tool is a research prototype to assist clinicians.
+    <b>Clinical Disclaimer:</b> This tool is a research prototype to assist clinicians.
     It does <b>not</b> replace professional medical judgment. All outputs must be reviewed by a qualified physician.
     </div>""", unsafe_allow_html=True)
 
@@ -399,19 +564,23 @@ elif nav == "Patient Intake Form":
 
     if submitted:
         with st.spinner("Harmonizing data points... calculating clinical toxicity..."):
-            time.sleep(0.5)
-
             g_val = 1 if gender == "Male" else 0
             f_val = 1 if fam_hist == "Yes" else 0
 
-            # SMOKING INDEX
-            s_base = min(cigs_per_day / 40.0, 1.0) if smoke_status != "Never Smoked" else 0.0
+            # SMOKING INDEX — only applies if actually smoked
+            if is_smoker:
+                s_base = _safe_float(cigs_per_day / 40.0)
+            else:
+                s_base = 0.0
             sh_map = {"None": 0.0, "Occasional (Social)": 0.1, "Daily (Home/Work)": 0.25}
-            s_idx  = min(s_base + sh_map[secondhand], 1.0)
+            s_idx = _safe_float(s_base + sh_map.get(secondhand, 0.0))
 
-            # PACK-YEAR PROXY (correct clinical formula, normalized to 30 pack-year cap)
-            clinical_pack_years = (cigs_per_day / 20.0) * years_smoked
-            pack_year_proxy     = min(clinical_pack_years / 30.0, 1.0)
+            # PACK-YEAR PROXY
+            if is_smoker:
+                clinical_pack_years = (cigs_per_day / 20.0) * years_smoked
+                pack_year_proxy = _safe_float(clinical_pack_years / 30.0)
+            else:
+                pack_year_proxy = 0.0
 
             # POLLUTION INDEX
             res_map = {
@@ -420,16 +589,16 @@ elif nav == "Patient Intake Form":
                 "Urban City Center (Poor)": 0.60,
                 "Industrial Zone (Hazardous)": 0.80
             }
-            p_idx = min(
-                res_map[residence]
+            p_base = res_map.get(residence, 0.10)
+            p_idx = _safe_float(
+                p_base
                 + (0.30 if occupation_hazard else 0.0)
                 + (0.20 if pulmonary_hx else 0.0)
                 + (0.20 if radon else 0.0)
-                + (0.15 if radiation_hx else 0.0),
-                1.0
+                + (0.15 if radiation_hx else 0.0)
             )
 
-            toxic_accum = (age / 100.0) * p_idx
+            toxic_accum = _safe_float((age / 100.0) * p_idx)
 
             # Frozen noise — deterministic inference
             noise_a, noise_b = 0.5, 0.5
@@ -443,30 +612,28 @@ elif nav == "Patient Intake Form":
 
             prob = float(model.predict_proba(input_df)[0][1])
 
-            # SYMPTOM BOOST — small, proportional adjustments (not flat additions)
-            # Applied as a weighted average so they can't push a 5% to 99%
-            # Formula: new_prob = prob + (1 - prob) * boost_fraction
-            # This means boosts compress as prob rises — prevents ceiling inflation
+            # SYMPTOM BOOST — capped at MAX_SYMPTOM_BOOST to prevent ceiling inflation
             symptom_boost_fraction = 0.0
             if sym_cough:  symptom_boost_fraction += 0.05
             if sym_weight: symptom_boost_fraction += 0.06
             if sym_breath: symptom_boost_fraction += 0.05
-            if sym_blood:  symptom_boost_fraction += 0.12   # serious red flag
-            if sym_pain:   symptom_boost_fraction += 0.09   # serious red flag
+            if sym_blood:  symptom_boost_fraction += 0.12
+            if sym_pain:   symptom_boost_fraction += 0.09
+            symptom_boost_fraction = min(symptom_boost_fraction, MAX_SYMPTOM_BOOST)
 
-            # Multiplicative boost: preserves calibration at both ends of the scale
+            # Multiplicative boost: preserves calibration at both ends
             prob = prob + (1.0 - prob) * symptom_boost_fraction
-            prob = min(prob, 0.97)   # hard cap — 100% certainty is not clinically sound
+            prob = min(prob, 0.97)
 
             genetic_synergy_active = (f_val == 1 and s_idx > 0.2)
 
         # ── OUTPUT ──────────────────────────────────────────
         st.markdown("### 📊 Clinical Analysis Report")
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("AI Risk Probability",  f"{prob:.1%}")
-        m2.metric("Pack-Year Proxy",      f"{pack_year_proxy:.2f}")
+        m1.metric("AI Risk Probability", f"{prob:.1%}")
+        m2.metric("Pack-Year Proxy", f"{pack_year_proxy:.2f}")
         m3.metric("Toxic Exposure Index", f"{toxic_accum:.2f}")
-        m4.metric("Genetic Synergist",    "Active ⚠️" if genetic_synergy_active else "Inactive ✅")
+        m4.metric("Genetic Synergist", "Active ⚠️" if genetic_synergy_active else "Inactive ✅")
 
         st.markdown("---")
 
@@ -478,23 +645,21 @@ elif nav == "Patient Intake Form":
             </div>""", unsafe_allow_html=True)
             st.progress(prob)
             risk_level = "CRITICAL"
-
         elif prob >= RISK_THRESHOLD:
             st.warning("⚠️ **ELEVATED RISK DETECTED** — Further investigation strongly recommended.")
             st.progress(prob)
             risk_level = "ELEVATED"
-
         else:
             st.success("✅ **LOW RISK**")
             st.progress(prob)
             risk_level = "LOW"
 
-        # ── RISK DRIVERS ────────────────────────────────────
+        # ── RISK DRIVERS (HTML-escaped user-derived values) ──
         reasons = []
         if pack_year_proxy >= 0.33:
-            reasons.append(f"Heavy cumulative smoking burden (Pack-Year Proxy: <b>{pack_year_proxy:.2f}</b> ≥ 10 pack-years).")
+            reasons.append(f"Heavy cumulative smoking burden (Pack-Year Proxy: <b>{_esc(f'{pack_year_proxy:.2f}')}</b> ≥ 10 pack-years).")
         elif pack_year_proxy > 0.10:
-            reasons.append(f"Moderate smoking history (Pack-Year Proxy: <b>{pack_year_proxy:.2f}</b>).")
+            reasons.append(f"Moderate smoking history (Pack-Year Proxy: <b>{_esc(f'{pack_year_proxy:.2f}')}</b>).")
         elif s_idx > 0.1:
             reasons.append("Secondhand / passive smoke exposure noted.")
 
@@ -504,19 +669,19 @@ elif nav == "Patient Intake Form":
             reasons.append("First-degree family history of lung cancer independently elevates baseline risk.")
 
         if p_idx >= 0.70:
-            reasons.append(f"Severe environmental/occupational toxicity (Pollution Index: <b>{p_idx:.2f}</b>).")
+            reasons.append(f"Severe environmental/occupational toxicity (Pollution Index: <b>{_esc(f'{p_idx:.2f}')}</b>).")
         elif p_idx >= 0.40:
-            reasons.append(f"Moderate environmental exposure (Pollution Index: <b>{p_idx:.2f}</b>).")
+            reasons.append(f"Moderate environmental exposure (Pollution Index: <b>{_esc(f'{p_idx:.2f}')}</b>).")
 
         if toxic_accum >= 0.35:
-            reasons.append(f"High age-weighted toxic accumulation (<b>{toxic_accum:.2f}</b>) — prolonged exposure history.")
+            reasons.append(f"High age-weighted toxic accumulation (<b>{_esc(f'{toxic_accum:.2f}')}</b>) — prolonged exposure history.")
         elif toxic_accum >= 0.15:
-            reasons.append(f"Moderate age-weighted toxic burden (<b>{toxic_accum:.2f}</b>).")
+            reasons.append(f"Moderate age-weighted toxic burden (<b>{_esc(f'{toxic_accum:.2f}')}</b>).")
 
         if age >= 55:
-            reasons.append(f"Age <b>{int(age)}</b> — risk increases significantly after 55.")
+            reasons.append(f"Age <b>{_esc(int(age))}</b> — risk increases significantly after 55.")
         elif age >= 40:
-            reasons.append(f"Age <b>{int(age)}</b> — entering moderate risk window (40–54).")
+            reasons.append(f"Age <b>{_esc(int(age))}</b> — entering moderate risk window (40–54).")
 
         if pulmonary_hx:
             reasons.append("Pre-existing pulmonary disease (COPD/Emphysema/TB) raises malignant transformation risk.")
@@ -616,7 +781,7 @@ elif nav == "Patient Intake Form":
 
     st.markdown("<br>", unsafe_allow_html=True)
     rm1, rm2, rm3, rm4 = st.columns(4)
-    rm1.metric("Adjusted Smoking Idx",  f"{s_final:.2f}")
-    rm2.metric("Pack-Year Proxy",        f"{pack_year_calc:.3f}")
+    rm1.metric("Adjusted Smoking Idx", f"{s_final:.2f}")
+    rm2.metric("Pack-Year Proxy", f"{pack_year_calc:.3f}")
     rm3.metric("Adjusted Pollution Idx", f"{p_final:.2f}")
-    rm4.metric("Toxic Accumulation",     f"{toxic_calc:.3f}")
+    rm4.metric("Toxic Accumulation", f"{toxic_calc:.3f}")
