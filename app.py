@@ -15,16 +15,12 @@ import plotly.express as px
 logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 
-# =========================================================
-# 1. CONFIGURATION
-# =========================================================
 st.set_page_config(
     page_title="TeleMedLink | Oncology AI",
     page_icon="🫁",
     layout="wide",
     initial_sidebar_state="expanded"
 )
-
 MODEL_CACHE_PATH = "model_cache.joblib"
 MODEL_HASH_PATH = "model_cache.hash"
 MODEL_HMAC_PATH = "model_cache.hmac"
@@ -57,7 +53,6 @@ st.markdown("""
     .critical-box{ padding:12px; border-radius:8px;  background-color:#fdecea; border-left:6px solid #e74c3c; margin-bottom:15px; color:#000000; }
     </style>
     """, unsafe_allow_html=True)
-
 
 # =========================================================
 # 3. BACKEND — MODEL PERSISTENCE & TRAINING
